@@ -1,7 +1,10 @@
 from typing import Any, Dict, List, Tuple
 
+import os
+
 import gymnasium as gym
 import hydra
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
@@ -73,6 +76,9 @@ class Policy(nn.Module):
         # self.fc1 should map from self.state_dim to hidden_size
         # self.fc2 should map from hidden_size to self.n_actions
 
+        self.fc1 = nn.Linear(self.state_dim, hidden_size)
+        self.fc2 = nn.Linear(hidden_size, self.n_actions)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Compute action probabilities for given state(s).
@@ -90,7 +96,15 @@ class Policy(nn.Module):
         # TODO: Apply fc1 followed by ReLU (Flatten input if needed)
         # TODO: Apply fc2 to get logits
         # TODO: Return softmax over logits along the last dimension
-        pass
+
+        if len(x.shape) == 1:
+            x = x.unsqueeze(0)
+
+        x = torch.relu(self.fc1(x))
+        action_logits = self.fc2(x)
+        action_probs = torch.softmax(action_logits, dim=-1)
+
+        return action_probs
 
 
 class REINFORCEAgent(AbstractAgent):
@@ -164,7 +178,18 @@ class REINFORCEAgent(AbstractAgent):
         # TODO: Pass state through the policy network to get action probabilities
         # If evaluate is True, return the action with highest probability
         # Otherwise, sample from the action distribution and return the log-probability as a key in the dictionary (Hint: use torch.distributions.Categorical)
-        return 0, {}  # Placeholder return value
+
+        if evaluate:
+            return torch.argmax(
+                self.policy.forward(torch.tensor(state)), dim=-1
+            ).item(), {}
+        else:
+            action_probs = self.policy.forward(torch.tensor(state))
+            dist = torch.distributions.Categorical(action_probs)
+            action = dist.sample()
+            log_prob = dist.log_prob(action)
+
+            return action.item(), {"log_prob": log_prob}
 
     def compute_returns(self, rewards: List[float]) -> torch.Tensor:
         """
@@ -186,7 +211,15 @@ class REINFORCEAgent(AbstractAgent):
         #       - Update R = r + gamma * R
         #       - Insert R at the beginning of the returns list
         # TODO: Convert the list of returns to a torch.Tensor and return
-        pass
+        R = 0
+        Discounted_returns: List[float] = []
+
+        # Iterate over rewards in reverse order
+        for r in reversed(rewards):
+            R = r + self.gamma * R
+            Discounted_returns.insert(0, R)
+
+        return torch.tensor(Discounted_returns, dtype=torch.float32)
 
     def update_agent(
         self,
@@ -216,9 +249,12 @@ class REINFORCEAgent(AbstractAgent):
 
         # TODO: Normalize returns with mean and standard deviation,
         # and add 1e-8 to the denominator to avoid division by zero
-        norm_returns = returns_t
+        norm_returns = (returns_t - returns_t.mean()) / (
+            returns_t.std(unbiased=False) + 1e-8
+        )
 
         lp_tensor = torch.stack(log_probs)
+
         loss = -torch.sum(lp_tensor * norm_returns)
 
         self.optimizer.zero_grad()
@@ -278,13 +314,30 @@ class REINFORCEAgent(AbstractAgent):
             Standard deviation of returns.
         """
         self.policy.eval()
-        returns: List[float] = []  # noqa: F841
+        episode_returns: List[float] = []  # noqa: F841
         # TODO: rollout num_episodes in eval_env and aggregate undiscounted returns across episodes
+        for _ in range(num_episodes):
+            state, _ = eval_env.reset()
+            done = False
+            episode_return = 0.0
+
+            while not done:
+                action = self.predict_action(state, evaluate=True)[0]
+                next_state, reward, term, trunc, _ = eval_env.step(action)
+                done = term or trunc
+                episode_return += reward
+                state = next_state
+
+            episode_returns.append(episode_return)
+
+        avg_return = np.mean(episode_returns)
+        std_return = np.std(episode_returns)
+        print(f"[Eval ] AvgReturn {avg_return:5.1f} ± {std_return:4.1f}")
 
         self.policy.train()  # Set back to training mode
 
         # TODO: Return the mean and std of the returns across episodes
-        return 0.0, 0.0
+        return avg_return, std_return
 
     def train(
         self,
@@ -302,6 +355,11 @@ class REINFORCEAgent(AbstractAgent):
         eval_interval : int, optional
             Frequency of evaluation prints (default is 10).
         """
+        # Initialize lists to store returns
+        train_returns = []
+        eval_returns = []
+        eval_episodes_recorded = []
+
         eval_env = gym.make(self.env.spec.id)  # fresh copy for eval
         for ep in range(1, num_episodes + 1):
             state, _ = self.env.reset()
@@ -317,6 +375,7 @@ class REINFORCEAgent(AbstractAgent):
 
             loss = self.update_agent(batch)
             total_return = sum(r for _, _, r, *_ in batch)
+            train_returns.append(total_return)  # Store training return
             self.total_episodes += 1
 
             if ep % 10 == 0:
@@ -324,9 +383,39 @@ class REINFORCEAgent(AbstractAgent):
 
             if ep % eval_interval == 0:
                 mean_ret, std_ret = self.evaluate(eval_env, num_episodes=eval_episodes)
+                eval_returns.append(mean_ret)  # Store average evaluation return
+                eval_episodes_recorded.append(ep)  # Store episode number for eval
                 print(f"[Eval ] Ep {ep:3d} AvgReturn {mean_ret:5.1f} ± {std_ret:4.1f}")
 
         print("Training complete.")
+
+        # Plot training and evaluation returns
+        plt.figure(figsize=(10, 6))
+        plt.plot(
+            range(1, num_episodes + 1),
+            train_returns,
+            label="Training Return",
+            color="blue",
+        )
+        plt.plot(
+            eval_episodes_recorded,
+            eval_returns,
+            label="Average Evaluation Return",
+            color="orange",
+            marker="o",
+        )
+        plt.xlabel("Episode")
+        plt.ylabel("Return")
+        plt.title("Training and Evaluation Returns over Episodes")
+        plt.legend()
+        plt.grid(True)
+
+        # Save the plot
+        plot_file = os.path.join(
+            os.path.dirname(__file__), "plots", "Training_Evaluation_Curve.png"
+        )
+        plt.savefig(plot_file)
+        plt.close()
 
 
 @hydra.main(
